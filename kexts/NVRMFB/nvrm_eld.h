@@ -29,6 +29,64 @@ enum { NVRM_ELD_CONN_HDMI = 0, NVRM_ELD_CONN_DP = 1 };
 // A CEA-861 data block's tag (top 3 bits of the block header byte).
 enum { NVRM_CEA_TAG_AUDIO = 1, NVRM_CEA_TAG_SPEAKER = 4, NVRM_CEA_TAG_VENDOR = 3 };
 
+// A sink can advertise up to 15 short audio descriptors; that is also what the ELD's 4-bit SAD count can hold.
+#define NVRM_CEA_MAX_SADS 15
+
+// One walk over the EDID's CEA-861 extension blocks. Two places need the same reading of the same bytes: the ELD
+// builder copies the SADs and the speaker map out of them, and the framebuffer's display-audio link decides from them
+// whether the sink announces audio and whether it is an HDMI sink. Sharing the scan means the ELD and the properties
+// cannot disagree -- an ELD with SADs implies av-signal-type 8, and no SADs implies no audio -- and keeps the bounds
+// checks in one place.
+struct nvrm_cea_scan {
+    uint8_t sad[NVRM_CEA_MAX_SADS * 3];
+    uint8_t sad_count;
+    uint8_t speaker_alloc;   // CEA speaker allocation, low 7 bits
+    uint8_t has_audio;       // at least one short audio descriptor: the sink accepts audio
+    uint8_t is_hdmi;         // HDMI Licensing VSDB present: an HDMI sink rather than a native DisplayPort one
+};
+
+// Fills s from the EDID's extension blocks. A truncated or malformed EDID leaves the counts at 0 rather than reading
+// past the buffer, so callers can use s unconditionally.
+static inline void nvrm_cea_scan(const uint8_t *edid, size_t edid_len, struct nvrm_cea_scan *s)
+{
+    s->sad_count = 0; s->speaker_alloc = 0; s->has_audio = 0; s->is_hdmi = 0;
+    if (!edid || edid_len < 128) return;                        // no base block, no extensions to follow
+
+    uint8_t ext_count = edid[126];
+    for (uint8_t e = 1; e <= ext_count; e++) {
+        size_t base = (size_t)e * 128;
+        if (base + 128 > edid_len) break;                       // the extension is not present in the buffer
+        const uint8_t *cea = edid + base;
+        if (cea[0] != 0x02 || cea[1] < 3) continue;             // not a CEA-861 rev-3+ block
+        uint8_t dtd = cea[2];                                   // data blocks run from byte 4 to dtd-1
+        if (dtd < 4 || dtd > 128) continue;
+        size_t p = 4;
+        while (p < dtd) {
+            uint8_t hdr = cea[p];
+            uint8_t tag = (uint8_t)(hdr >> 5), len = (uint8_t)(hdr & 0x1F);
+            if (p + 1 + len > dtd) break;                       // block runs past the data region: stop
+            const uint8_t *body = cea + p + 1;
+            if (tag == NVRM_CEA_TAG_AUDIO) {
+                for (uint8_t i = 0; i + 3 <= len; i += 3) {
+                    if (s->sad_count >= NVRM_CEA_MAX_SADS) break;
+                    s->sad[s->sad_count*3 + 0] = body[i];
+                    s->sad[s->sad_count*3 + 1] = body[i+1];
+                    s->sad[s->sad_count*3 + 2] = body[i+2];
+                    s->sad_count++;
+                }
+            } else if (tag == NVRM_CEA_TAG_SPEAKER && len >= 1) {
+                s->speaker_alloc = body[0];
+            } else if (tag == NVRM_CEA_TAG_VENDOR && len >= 3 &&
+                       body[0] == 0x03 && body[1] == 0x0C && body[2] == 0x00) {
+                s->is_hdmi = 1;                                 // HDMI Licensing OUI 00-0C-03 => HDMI sink
+            }
+            p += 1 + len;
+        }
+    }
+    // A block shorter than one SAD is not a format the sink can play, so audio is announced only by real descriptors.
+    s->has_audio = s->sad_count > 0;
+}
+
 // Returns the number of bytes written to out (a multiple of 4), or 0 if the EDID is too short/malformed to describe a
 // sink. out must hold at least NVRM_ELD_MAX bytes. conn_type is NVRM_ELD_CONN_HDMI or NVRM_ELD_CONN_DP.
 static inline size_t nvrm_build_eld(const uint8_t *edid, size_t edid_len, int conn_type, uint8_t *out)
@@ -55,48 +113,17 @@ static inline size_t nvrm_build_eld(const uint8_t *edid, size_t edid_len, int co
     }
     if (mnl > 13) mnl = 13;
 
-    // --- CEA-861 extension block: Short Audio Descriptors and the speaker-allocation byte ---
-    uint8_t sad[15 * 3]; uint8_t sad_count = 0; uint8_t speaker_alloc = 0;
-    uint8_t ext_count = edid[126];
-    int saw_hdmi_vsdb = 0;
-    for (uint8_t e = 1; e <= ext_count; e++) {
-        size_t base = (size_t)e * 128;
-        if (base + 128 > edid_len) break;                       // the extension is not present in the buffer
-        const uint8_t *cea = edid + base;
-        if (cea[0] != 0x02 || cea[1] < 3) continue;             // not a CEA-861 rev-3+ block
-        uint8_t dtd = cea[2];                                   // data blocks run from byte 4 to dtd-1
-        if (dtd < 4 || dtd > 128) continue;
-        size_t p = 4;
-        while (p < dtd) {
-            uint8_t hdr = cea[p];
-            uint8_t tag = (uint8_t)(hdr >> 5), len = (uint8_t)(hdr & 0x1F);
-            if (p + 1 + len > dtd) break;                       // block runs past the data region: stop
-            const uint8_t *body = cea + p + 1;
-            if (tag == NVRM_CEA_TAG_AUDIO) {
-                for (uint8_t i = 0; i + 3 <= len; i += 3) {
-                    if (sad_count >= 15) break;
-                    sad[sad_count*3 + 0] = body[i];
-                    sad[sad_count*3 + 1] = body[i+1];
-                    sad[sad_count*3 + 2] = body[i+2];
-                    sad_count++;
-                }
-            } else if (tag == NVRM_CEA_TAG_SPEAKER && len >= 1) {
-                speaker_alloc = body[0];                         // CEA speaker allocation, low 7 bits
-            } else if (tag == NVRM_CEA_TAG_VENDOR && len >= 3 &&
-                       body[0] == 0x03 && body[1] == 0x0C && body[2] == 0x00) {
-                saw_hdmi_vsdb = 1;                               // HDMI Licensing OUI 00-0C-03 => HDMI sink
-            }
-            p += 1 + len;
-        }
-    }
+    // --- CEA-861 extension blocks: Short Audio Descriptors, the speaker-allocation byte, the HDMI VSDB ---
+    struct nvrm_cea_scan cea;
+    nvrm_cea_scan(edid, edid_len, &cea);
     // A native DisplayPort sink carries no HDMI VSDB in its CEA block; only an HDMI sink (or an HDMI adapter on a DP
     // port) does. Its presence is therefore decisive for the audio path and overrides the caller's connector guess.
-    if (saw_hdmi_vsdb) conn_type = NVRM_ELD_CONN_HDMI;
+    if (cea.is_hdmi) conn_type = NVRM_ELD_CONN_HDMI;
     conn_type &= 0x3;
 
     // --- assemble ---
     // Baseline block = 4 (ver/sad/conn/synch) + 8 (port id) + 2 (mfr) + 2 (product) + mnl + 3*sad_count, padded to 4.
-    size_t baseline = 16u + (size_t)mnl + (size_t)sad_count * 3u;
+    size_t baseline = 16u + (size_t)mnl + (size_t)cea.sad_count * 3u;
     size_t pad = (4u - (baseline & 3u)) & 3u;
     size_t baseline_padded = baseline + pad;
     size_t total = 4u + baseline_padded;
@@ -107,14 +134,14 @@ static inline size_t nvrm_build_eld(const uint8_t *edid, size_t edid_len, int co
     out[2] = (uint8_t)(baseline_padded / 4u);                  // baseline length in DWORDs
     uint8_t *bl = out + 4;
     bl[0] = (uint8_t)((1u << 5) | (mnl & 0x1F));               // CEA_EDID_Ver = 1, MNL
-    bl[1] = (uint8_t)(((sad_count & 0x0F) << 4) | ((conn_type & 0x3) << 2));  // SAD count, conn type, S_AI/HDCP = 0
+    bl[1] = (uint8_t)(((cea.sad_count & 0x0F) << 4) | ((conn_type & 0x3) << 2));  // SAD count, conn type, S_AI/HDCP = 0
     bl[2] = 0;                                                  // aud_synch_delay: unknown, 0 = no added delay
-    bl[3] = (uint8_t)(speaker_alloc & 0x7F);
+    bl[3] = (uint8_t)(cea.speaker_alloc & 0x7F);
     // bl[4..11] port id: left 0 (a fixed per-port id is optional; the pairing is carried by hda-gfx, not the ELD)
     bl[12] = mfr0; bl[13] = mfr1;
     bl[14] = prod0; bl[15] = prod1;
     for (uint8_t i = 0; i < mnl; i++) bl[16 + i] = (uint8_t)name[i];
-    for (uint8_t i = 0; i < sad_count * 3; i++) bl[16 + mnl + i] = sad[i];
+    for (uint8_t i = 0; i < cea.sad_count * 3; i++) bl[16 + mnl + i] = cea.sad[i];
     return total;
 }
 

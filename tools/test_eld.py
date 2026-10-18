@@ -15,6 +15,12 @@ STUB = r'''#ifndef NVRM_ELD_H
 enum { NVRM_ELD_CONN_HDMI = 0, NVRM_ELD_CONN_DP = 1 };
 #define NVRM_ELD_MAX 128
 enum { NVRM_CEA_TAG_AUDIO = 1, NVRM_CEA_TAG_SPEAKER = 4, NVRM_CEA_TAG_VENDOR = 3 };
+struct nvrm_cea_scan { uint8_t sad[15 * 3]; uint8_t sad_count, speaker_alloc, has_audio, is_hdmi; };
+/* baseline-only: the scan before this change never looked at the CEA block either */
+static inline void nvrm_cea_scan(const uint8_t *e, size_t n, struct nvrm_cea_scan *s){
+    (void)e; (void)n;
+    for (size_t i = 0; i < sizeof *s; i++) ((uint8_t *)s)[i] = 0;
+}
 /* baseline-only: ignores the CEA block entirely -- the driver's behaviour before nvrm_eld.h existed */
 static inline size_t nvrm_build_eld(const uint8_t *e, size_t n, int conn, uint8_t *o){
     if(!e||!o||n<128) return 0;
