@@ -55,6 +55,9 @@ mode timings and EDIDs, and drives vblank from the GPU. **NVAccel.kext** is the 
 IOSurface use for the shared surfaces the plugin renders into. **NVRMAGDC.kext** answers Apple's graphics-device-control
 policy queries for the card.
 
+Sound over HDMI and DisplayPort goes through AppleHDA, which needs the framebuffer to publish a display-codec
+association; [DISPLAY-AUDIO.md](DISPLAY-AUDIO.md) covers what NVRMFB and NMHDA publish for it.
+
 All four kexts install into `/Library/Extensions` and load from the Auxiliary Kernel Collection that `install.sh`
 rebuilds with `kmutil`. They are not injected by OpenCore: the display kexts link against Apple frameworks
 (IOGraphicsFamily, IOAcceleratorFamily2) that only exist in macOS's own kernel collections.
