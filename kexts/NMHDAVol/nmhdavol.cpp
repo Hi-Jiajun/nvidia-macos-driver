@@ -76,6 +76,13 @@ static const char *kAudioPath[] {
 };
 static KernelPatcher::KextInfo kAudioFamily { "com.apple.iokit.IOAudioFamily", kAudioPath, arrsize(kAudioPath),
     {}, {}, KernelPatcher::KextInfo::Unloaded };
+static const char *kHdaPath[] {
+    "/System/Library/Extensions/AppleHDA.kext/Contents/MacOS/AppleHDA"
+};
+static KernelPatcher::KextInfo kAppleHDA { "com.apple.driver.AppleHDA", kHdaPath, arrsize(kHdaPath),
+    {}, {}, KernelPatcher::KextInfo::Unloaded };
+// Lilu keeps this array (it writes loadIndex into it), so it must outlive pluginStart.
+static KernelPatcher::KextInfo kPatchedKexts[] { kAudioFamily, kAppleHDA };
 
 static mach_vm_address_t orgClip;
 static IOReturn clipOutputSamples(IOAudioEngine *self, const void *mixBuf, void *sampleBuf, UInt32 firstSampleFrame,
@@ -95,21 +102,15 @@ static IOReturn clipOutputSamples(IOAudioEngine *self, const void *mixBuf, void 
     return r;
 }
 
-static bool onEngineMatched(void *, void *, IOService *service, IONotifier *) {
-    // IOAudioFamily lives in SystemKernelExtensions, which OpenCore does not link against while injecting into the
-    // prelinked kernel — so this plugin may not reference its symbols. The class is cast by name and allocated
-    // through OSMetaClass (kernel core); every call below is a virtual dispatch.
-    OSMetaClassBase *mcb = service ? service->metaCast("IOAudioEngine") : nullptr;
-    IOService *svc = mcb ? static_cast<IOService *>(mcb) : nullptr;
-    IOAudioEngine *engine = svc ? static_cast<IOAudioEngine *>(svc) : nullptr;
-    if (!engine || !isDisplayEngine(engine) || gControl) return true;
+static void attachVolumeControl(IOAudioEngine *engine) {
+    if (!engine || !isDisplayEngine(engine) || gControl) return;
     OSObject *alloc = OSMetaClass::allocClassWithName("IOAudioLevelControl");
     IOAudioLevelControl *c = alloc ? static_cast<IOAudioLevelControl *>(alloc) : nullptr;
     if (!c || !c->init(gVolume, 0, 100, 0, 0, kIOAudioControlChannelIDAll, "Display", 0, 0,
                        kIOAudioControlUsageOutput)) {
         if (c) c->release();
         report("level control allocation failed");
-        return true;
+        return;
     }
     c->setValueChangeHandler(volumeChanged, nullptr);
     if (engine->addDefaultAudioControl(c) == kIOReturnSuccess) {
@@ -119,8 +120,29 @@ static bool onEngineMatched(void *, void *, IOService *service, IONotifier *) {
         report("addDefaultAudioControl refused");
         c->release();
     }
+}
+
+// The engine publishes its controls to the HAL before coreaudiod opens it; a control added afterwards never
+// reaches CoreAudio. IOAudioEngine::start is a base-class symbol that exists in the kernel collection, while
+// AppleHDA's own methods have no symbols at all, so the control is attached here.
+static mach_vm_address_t orgEngineStart;
+static bool engineStart(IOAudioEngine *self, IOService *provider) {
+    bool r = FunctionCast(engineStart, orgEngineStart)(self, provider);
+    if (r) attachVolumeControl(self);
+    return r;
+}
+
+static bool onEngineMatched(void *, void *, IOService *service, IONotifier *) {
+    // IOAudioFamily lives in SystemKernelExtensions, which OpenCore does not link against while injecting into the
+    // prelinked kernel — so this plugin may not reference its symbols. The class is cast by name and allocated
+    // through OSMetaClass (kernel core); every call below is a virtual dispatch.
+    OSMetaClassBase *mcb = service ? service->metaCast("IOAudioEngine") : nullptr;
+    IOService *svc = mcb ? static_cast<IOService *>(mcb) : nullptr;
+    attachVolumeControl(svc ? static_cast<IOAudioEngine *>(svc) : nullptr);
     return true;
 }
+
+static void onKextLoaded(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t, size_t);
 
 static void pluginStart() {
     sysctl_register_oid(&sysctl__debug_nmhdavol);
@@ -129,19 +151,21 @@ static void pluginStart() {
         IOService::addMatchingNotification(gIOMatchedNotification, m, onEngineMatched, nullptr, nullptr, 0);
         m->release();
     }
+    lilu.onKextLoadForce(kPatchedKexts, arrsize(kPatchedKexts), onKextLoaded);
     report("waiting for AppleHDA");
 }
 
-static void onAudioLoaded(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t, size_t) {
-    report("IOAudioFamily loaded (index %lu, ours %lu)", (unsigned long)index, (unsigned long)kAudioFamily.loadIndex);
-    if (index != kAudioFamily.loadIndex) return;
-    KernelPatcher::RouteRequest req {
-        "__ZN12IOAudioEngine17clipOutputSamplesEPKvPvjjPK18IOAudioStreamFormatP14IOAudioStream",
+// One callback for both kexts: whichever of the two symbols lives in the kext under this index routes here, and
+// the other lookup simply fails. Comparing loadIndex is not reliable across Lilu versions, so it is not done.
+static void onKextLoaded(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t, size_t) {
+    KernelPatcher::RouteRequest clip {
+        "__ZN13IOAudioEngine17clipOutputSamplesEPKvPvjjPK20_IOAudioStreamFormatP13IOAudioStream",
         clipOutputSamples, orgClip };
-    if (patcher.routeMultiple(index, &req, 1))
-        report("clipOutputSamples routed");
-    else
-        report("could not route clipOutputSamples (patcher error %d)", patcher.getError());
+    if (patcher.routeMultiple(index, &clip, 1)) report("clipOutputSamples routed (kext %lu)", (unsigned long)index);
+    patcher.clearError();
+    KernelPatcher::RouteRequest start {
+        "__ZN13IOAudioEngine5startEP9IOService", engineStart, orgEngineStart };
+    if (patcher.routeMultiple(index, &start, 1)) report("IOAudioEngine::start routed (kext %lu)", (unsigned long)index);
     patcher.clearError();
 }
 
