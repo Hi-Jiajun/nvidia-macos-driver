@@ -44,19 +44,33 @@ the display.
 The same properties belong in `nvrm-fb.cpp`'s display-audio block; this kext exists because NVRMFB has no
 build path in this tree.
 
-## NMHDAVol (experimental)
+## NMHDAVol (unsafe - do not enable)
 
 AppleHDA's display engine has a selector but no `IOAudioLevelControl`, so CoreAudio greys out the volume
-slider (real Macs behave the same). NMHDAVol routes `IOAudioEngine::clipOutputSamples`, scales only the
-frames of an `AppleHDAEngineOutputDP`, and attaches a level control to that engine.
+slider (real Macs behave the same). NMHDAVol was an attempt to add one; it is kept here as a record and
+must stay disabled.
 
-Two constraints shaped it:
+What it does: routes `IOAudioEngine::clipOutputSamples` and scales the frames of an
+`AppleHDAEngineOutputDP`, and attaches a level control to that engine. The source is compiled against no
+IOAudioFamily symbols (that kext lives in `SystemKernelExtensions`, outside the prelinked kernel OpenCore
+links against), so it reaches the engine with `metaCast` and allocates the control through
+`OSMetaClass::allocClassWithName`, with virtual dispatch afterwards.
 
-- `IOAudioFamily` lives in `SystemKernelExtensions`, which OpenCore does not link against while injecting
-  into the prelinked kernel, so the plugin must not reference IOAudioFamily symbols. It gets the engine
-  with `metaCast("IOAudioEngine")` and allocates the control with `OSMetaClass::allocClassWithName`, and
-  every call after that is a virtual dispatch.
-- The volume is a percentage in `sysctl debug.nmhdavol`.
+**Why it is unsafe.** Attaching the control from `IOAudioEngine::start` panics: that method is called
+from `AppleHDAController::activateAudioEngine`, and adding a control while the controller walks the
+engine's controls corrupts its state. Backtrace, 2026-10-18:
+
+```
+panic: general protection fault
+AppleHDAHDMI_DPDriver::initHardware
+  -> AppleHDAController::activateAudioEngine(IOAudioEngine*)
+     -> IOAudioEngine::start(IOAudioEngine*) -> (NMHDAVol) addDefaultAudioControl
+```
+
+Attaching after the engine started is safe but useless: the HAL has already enumerated the engine's
+controls, so `get volume settings` keeps returning `missing value` even after `killall coreaudiod`.
+There is no seam between those two moments that a third-party kext can use, and AppleHDA's own methods
+have no symbols in the kernel collection to route.
 
 ## Install
 
