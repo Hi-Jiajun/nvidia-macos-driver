@@ -498,6 +498,40 @@ static NvKmsKapiDisplay gBootDpy = 0;
 static struct NvKmsKapiDisplayMode gBootMode;
 static NvU32 gHeadsTaken;
 static NvU32 gNumHeads;
+
+// The display-codec association AppleHDAController reads from the framebuffer before it will tie a display to the
+// GPU's HDA codec. The ELD and hda-gfx this driver already publishes are not enough: without audio-codec-info the
+// controller looks its PCI id up in a table with no NVIDIA entries, never tells AppleHDAHDMI_DPDriver about the
+// display, and no AppleHDAEngineOutputDP is created. connector-type/port-number/av-signal-type decide which display
+// head the audio belongs to. Measured on an RTX 5060 with macOS 15.8.1.
+//
+// The sink is read through the same nvrm_cea_scan() the ELD uses, so the two cannot disagree: SADs in the ELD mean
+// av-signal-type 8 here, and a sink without SADs gets 0. connector-type follows the HDMI VSDB rather than the
+// connector the driver guessed, so a DisplayPort sink is not announced as HDMI.
+static void publishDisplayAudioLink(IORegistryEntry *fb, const uint8_t *edid, size_t n, bool internal)
+{
+    if (!fb) return;
+    if (internal || !edid || n < 128) {
+        // No sink to describe (an internal panel, or an EDID that could not be read): the controller must not tie this
+        // head to the codec. The other four properties are left as they were; the framebuffer that drove a display
+        // keeps its record of it, the same way nvda-eld is kept.
+        uint8_t none[4] = { 0, 0, 0, 0 };
+        fb->setProperty("av-signal-type", none, sizeof none);
+        return;
+    }
+
+    struct nvrm_cea_scan cea;
+    nvrm_cea_scan(edid, n, &cea);
+    uint8_t conn[4] = { 0x00, (uint8_t)(cea.is_hdmi ? 0x08 : 0x04), 0x00, 0x00 };   // 0x800 HDMI / 0x400 DP
+    fb->setProperty("connector-type", conn, sizeof conn);
+    uint8_t port[4] = { 0, 0, 0, 0 };
+    fb->setProperty("port-number", port, sizeof port);
+    uint8_t codec[4] = { 0x00, 0x01, 0x04, 0x00 };               // codec 0, byte 1 = 1, pin widget 4
+    fb->setProperty("audio-codec-info", codec, sizeof codec);
+    uint8_t sig[4] = { (uint8_t)(cea.has_audio ? 0x08 : 0x00), 0, 0, 0 };
+    fb->setProperty("av-signal-type", sig, sizeof sig);
+    if (OSData *d = OSData::withBytes(edid, (unsigned)n)) { fb->setProperty("IODisplayEDID", d); d->release(); }
+}
 // Flip-cache allocation epoch. The cache is keyed by the NvKmsKapiMemory pointer, and a buffer allocated after a free can
 // land at the freed one's address; a cache hit then scanned out the old surface over freed memory, and after a refresh or
 // resolution change on either monitor the other one strobed black every other frame. Every grant and release advances
@@ -861,6 +895,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
                 FBLOG("fb%u: EDID %u B yielded no ELD; no display-audio properties published",
                       fIndex, (unsigned)fEdidSize);
         }
+        publishDisplayAudioLink(this, fEdid, fEdidSize, fInternal);
         NvU32 avail = r->headMask & ~gHeadsTaken;
         if (gBootHead >= 0) {
             if (fDisplay == gBootDpy && (avail & (1u << gBootHead))) avail = 1u << gBootHead;
@@ -1217,6 +1252,7 @@ void NVRMNVDAFramebuffer::adoptSwappedDisplay()
         if (eldn) { if (OSData *d = OSData::withBytes(eld, (unsigned)eldn)) { setProperty("nvda-eld", d); d->release(); } }
         else removeProperty("nvda-eld");
     }
+    publishDisplayAudioLink(this, fEdid, fEdidSize, fInternal);
     const NvU64 keepAlloc = fAllocSize;
     const NvU32 oldW = fScalerMaxW, oldH = fScalerMaxH;
     computeScanoutCaps(fPitchAlign);
