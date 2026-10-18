@@ -30,6 +30,15 @@ static IORegistryEntry *framebufferAbove(IOService *svc) {
     return e;
 }
 
+// NVRMFB reports kIOConnectionBuiltIn for a laptop panel; an eDP/LVDS display has no audio sink to describe.
+static bool isInternalPanel(IOService *svc) {
+    IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, svc);
+    if (!fb) return false;
+    uintptr_t flags = 0;
+    if (fb->getAttributeForConnection(0, kConnectionFlags, &flags) != kIOReturnSuccess) return false;
+    return (flags & kIOConnectionBuiltIn) != 0;
+}
+
 // Read the whole EDID (base block + CEA extensions) the same way IODisplayConnect does.
 static UInt32 readEdid(IOService *svc, UInt8 *out, UInt32 max) {
     IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, svc);
@@ -87,6 +96,12 @@ static void publish(IORegistryEntry *fb, const UInt8 *edid, UInt32 edidLen, bool
 }
 
 static bool onFramebuffer(void *, void *, IOService *svc, IONotifier *) {
+    if (isInternalPanel(svc)) {
+        UInt8 zero[4] = {0, 0, 0, 0};
+        svc->setProperty("av-signal-type", zero, sizeof zero);
+        IOLog("nmhdalink: %s is an internal panel, no display audio published\n", svc->getName());
+        return true;
+    }
     UInt8 edid[512];
     UInt32 n = readEdid(svc, edid, sizeof edid);
     publish(svc, n ? edid : nullptr, n, n != 0);
@@ -99,6 +114,11 @@ static bool onDisplay(void *, void *, IOService *svc, IONotifier *) {
     OSData *edid = OSDynamicCast(OSData, svc->getProperty("IODisplayEDID"));
     IORegistryEntry *fb = framebufferAbove(svc);
     if (!fb) return true;
+    if (isInternalPanel(OSDynamicCast(IOService, fb))) {
+        UInt8 zero[4] = {0, 0, 0, 0};
+        fb->setProperty("av-signal-type", zero, sizeof zero);
+        return true;
+    }
     if (edid && edid->getLength() >= 128)
         publish(fb, (const UInt8 *)edid->getBytesNoCopy(), edid->getLength(), true);
     else
