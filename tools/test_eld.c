@@ -129,6 +129,38 @@ int main(void)
         CHECK(((out[4+1] >> 2) & 3) == NVRM_ELD_CONN_HDMI, "VSDB promoted the guess to HDMI");
     }
 
+    // 6. The scan the ELD and the framebuffer's display-audio link share must report the sink the same way to both:
+    //    exactly one SAD count, one audio answer, one HDMI answer, so the ELD's SADs and av-signal-type cannot disagree.
+    printf("case: nvrm_cea_scan reports the block it parsed\n");
+    {
+        uint8_t edid[256]; base_block(edid, 1); cea_block(edid + 128);
+        struct nvrm_cea_scan s;
+        nvrm_cea_scan(edid, sizeof edid, &s);
+        CHECK(s.sad_count == 2, "scan found both SADs");
+        CHECK(s.has_audio == 1, "scan announces audio");
+        CHECK(s.is_hdmi == 1, "scan found the HDMI VSDB");
+        CHECK(s.speaker_alloc == 0x07, "scan found the speaker allocation");
+        CHECK(s.sad[0] == 0x09 && s.sad[5] == 0x50, "scan holds the SAD bytes verbatim");
+
+        uint8_t none[128]; base_block(none, 0);
+        nvrm_cea_scan(none, sizeof none, &s);
+        CHECK(s.sad_count == 0 && !s.has_audio && !s.is_hdmi && s.speaker_alloc == 0,
+              "a sink with no CEA block announces nothing");
+
+        // An audio block too short for one SAD is not a format the sink can play: the scan must not call that audio,
+        // or the framebuffer would publish av-signal-type 8 for a sink whose ELD has zero SADs.
+        uint8_t stunted[256]; base_block(stunted, 1);
+        uint8_t *c = stunted + 128; memset(c, 0, 128);
+        c[0] = 0x02; c[1] = 0x03; c[2] = 7;                     // one data block, ending at byte 7
+        c[4] = (uint8_t)((NVRM_CEA_TAG_AUDIO << 5) | 2); c[5] = 0x09; c[6] = 0x07;
+        nvrm_cea_scan(stunted, sizeof stunted, &s);
+        CHECK(s.sad_count == 0 && !s.has_audio, "a truncated audio block is not audio");
+        CHECK(!s.is_hdmi, "and it carries no HDMI VSDB");
+
+        nvrm_cea_scan(NULL, 0, &s);
+        CHECK(s.sad_count == 0 && !s.has_audio && !s.is_hdmi, "NULL EDID scans to nothing");
+    }
+
     printf(g_fail ? "\n%d assertion(s) FAILED\n" : "\nall assertions passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
